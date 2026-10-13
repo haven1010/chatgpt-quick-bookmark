@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT 随手书签",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "在 ChatGPT 对话中保存多个阅读位置，随时跳回。",
   "permissions": [
     "storage"

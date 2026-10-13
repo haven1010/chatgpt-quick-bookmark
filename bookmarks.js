@@ -6,6 +6,7 @@
   const BLOCKS = "h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,.katex-display";
   let route = location.pathname;
   let bookmarks = [];
+  const liveTargets = new Map();
   let selectedText = "";
   let selectedElement = null;
   let noticeTimer;
@@ -130,6 +131,21 @@
     return document.querySelector("main") || document.querySelector('[role="main"]');
   }
   function blocks(scope) { return [...scope.querySelectorAll(BLOCKS)]; }
+  function contentY(element) {
+    const scrollElement = scroller(element);
+    const origin = scrollElement === document.scrollingElement ||
+      scrollElement === document.documentElement ? 0 :
+      scrollElement.getBoundingClientRect().top;
+    return scrollElement.scrollTop + element.getBoundingClientRect().top - origin;
+  }
+  function nearSavedPosition(bookmark, element) {
+    if (!Number.isFinite(bookmark.anchorY) && !Number.isFinite(bookmark.top)) return true;
+    const expectedY = Number.isFinite(bookmark.anchorY)
+      ? bookmark.anchorY : bookmark.top + innerHeight * .4;
+    const tolerance = Number.isFinite(bookmark.anchorY)
+      ? Math.max(innerHeight, 900) : innerHeight * 1.5;
+    return Math.abs(contentY(element) - expectedY) <= tolerance;
+  }
   function turnOf(element) {
     return element?.closest("article") || element?.closest("[data-message-id]") || null;
   }
@@ -151,36 +167,39 @@
   }
   function findTarget(bookmark, nearbyOnly = false) {
     const main = mainContent();
-    if (!main || (!bookmark.text && !bookmark.blockText)) return null;
-    const turn = findTurn(bookmark, main);
-    if (!turn && (bookmark.turnId || Number.isInteger(bookmark.turnIndex) &&
-        bookmark.turnIndex >= 0)) return null;
-    const scope = turn || main;
-    const candidates = blocks(scope);
-    const expectedIndex = turn ? bookmark.blockIndex : bookmark.index;
+    if (!bookmark.text && !bookmark.blockText) return null;
+    const turn = main && findTurn(bookmark, main);
     const sameText = element => {
       if (!element) return false;
       const content = normalize(element.textContent);
-      return Boolean(bookmark.text && content.includes(bookmark.text)) ||
+      const visibleText = normalize(element.innerText);
+      return Boolean(bookmark.text &&
+        (content.includes(bookmark.text) || visibleText.includes(bookmark.text))) ||
         Boolean(bookmark.blockText && content.includes(bookmark.blockText));
     };
-    if (Number.isInteger(expectedIndex) && expectedIndex >= 0 &&
-        sameText(candidates[expectedIndex]) &&
-        (!nearbyOnly || visible(candidates[expectedIndex]))) return candidates[expectedIndex];
-    const matches = candidates.map((element, index) => ({ element, index }))
-      .filter(item => sameText(item.element));
-    if (nearbyOnly) {
-      const visibleMatches = matches.filter(item => visible(item.element));
-      if (visibleMatches.length) return visibleMatches.sort((a, b) =>
-        Math.abs(a.element.getBoundingClientRect().top - innerHeight * .4) -
-        Math.abs(b.element.getBoundingClientRect().top - innerHeight * .4))[0].element;
-      return null;
+    for (const scope of turn ? [turn, main, document] : main ? [main, document] : [document]) {
+      const candidates = blocks(scope);
+      const expectedIndex = scope === turn ? bookmark.blockIndex : bookmark.index;
+      if (Number.isInteger(expectedIndex) && expectedIndex >= 0 &&
+          sameText(candidates[expectedIndex]) &&
+          nearSavedPosition(bookmark, candidates[expectedIndex]) &&
+          (!nearbyOnly || visible(candidates[expectedIndex]))) return candidates[expectedIndex];
+      const matches = candidates.map((element, index) => ({ element, index }))
+        .filter(item => sameText(item.element) &&
+          nearSavedPosition(bookmark, item.element) &&
+          (!nearbyOnly || visible(item.element)));
+      if (matches.length) {
+        matches.sort((a, b) => {
+          if (Number.isInteger(expectedIndex) && expectedIndex >= 0) {
+            return Math.abs(a.index - expectedIndex) - Math.abs(b.index - expectedIndex);
+          }
+          return Math.abs(a.element.getBoundingClientRect().top - innerHeight * .4) -
+            Math.abs(b.element.getBoundingClientRect().top - innerHeight * .4);
+        });
+        return matches[0].element;
+      }
     }
-    if (Number.isInteger(expectedIndex) && expectedIndex >= 0) {
-      matches.sort((a, b) =>
-        Math.abs(a.index - expectedIndex) - Math.abs(b.index - expectedIndex));
-    }
-    return matches[0]?.element || null;
+    return null;
   }
   function visibleBlock() {
     const main = mainContent();
@@ -219,6 +238,7 @@
     const path = location.pathname;
     route = path;
     bookmarks = [];
+    liveTargets.clear();
     setExpanded(false);
     render();
     try {
@@ -251,8 +271,9 @@
       say("这里已经标记过了");
       return;
     }
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     bookmarks.unshift({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      id,
       top,
       text,
       index,
@@ -260,10 +281,12 @@
       turnIndex,
       blockIndex,
       blockText: normalize(target?.textContent).slice(0, 160),
+      anchorY: target ? contentY(target) : null,
       label: (text || normalize(target?.innerText) || "当前阅读位置").slice(0, 40)
     });
     try {
       await persist();
+      if (target) liveTargets.set(id, { target, scrollElement: scroller(target) });
       setExpanded(false);
       say(`已添加书签 · 共 ${bookmarks.length} 处`);
     } catch (_) { bookmarks.shift(); render(); say("保存失败，请刷新网页"); }
@@ -271,17 +294,24 @@
   async function deleteBookmark(id) {
     const previous = bookmarks;
     bookmarks = bookmarks.filter(item => item.id !== id);
-    try { await persist(); }
+    try { await persist(); liveTargets.delete(id); }
     catch (_) { bookmarks = previous; render(); say("删除失败，请刷新网页"); }
   }
   async function jumpTo(bookmark) {
+    const live = liveTargets.get(bookmark.id);
+    if (live?.target?.isConnected && location.pathname === route) {
+      highlight(live.target);
+      return;
+    }
     const hasTurn = Boolean(bookmark.turnId) ||
       Number.isInteger(bookmark.turnIndex) && bookmark.turnIndex >= 0;
-    let target = hasTurn ? findTarget(bookmark) : null;
+    let target = findTarget(bookmark);
     if (target) { highlight(target); return; }
     const main = mainContent();
     const visibleTurn = main && [...main.querySelectorAll("article")].find(visible);
-    scroller(visibleTurn || visibleBlock()).scrollTo({ top: bookmark.top, behavior: "auto" });
+    const scrollElement = live?.scrollElement?.isConnected
+      ? live.scrollElement : scroller(visibleTurn || visibleBlock());
+    scrollElement.scrollTo({ top: bookmark.top, behavior: "auto" });
     if (!bookmark.text && !bookmark.blockText) {
       say("已返回保存时的阅读位置");
       return;
@@ -307,7 +337,7 @@
       ? selection.getRangeAt(0).startContainer : null;
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     const block = element?.closest(BLOCKS);
-    selectedElement = block && mainContent()?.contains(block) ? block : null;
+    selectedElement = block?.getRootNode() === document ? block : null;
   }
   ui.getElementById("quick-save").addEventListener("pointerdown", prepareSelection);
   ui.getElementById("panel-save").addEventListener("pointerdown", prepareSelection);
