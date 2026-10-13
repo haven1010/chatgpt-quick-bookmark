@@ -129,29 +129,72 @@
   function mainContent() {
     return document.querySelector("main") || document.querySelector('[role="main"]');
   }
-  function findText(text, expectedIndex = -1) {
-    if (!text) return null;
+  function blocks(scope) { return [...scope.querySelectorAll(BLOCKS)]; }
+  function turnOf(element) {
+    return element?.closest("article") || element?.closest("[data-message-id]") || null;
+  }
+  function turnId(turn) {
+    return turn?.getAttribute("data-turn-id") ||
+      turn?.getAttribute("data-message-id") ||
+      turn?.getAttribute("data-testid") || "";
+  }
+  function findTurn(bookmark, main) {
+    const turns = [...main.querySelectorAll("article")];
+    if (bookmark.turnId) {
+      const match = turns.find(turn => turnId(turn) === bookmark.turnId) ||
+        [...main.querySelectorAll("[data-message-id]")]
+          .find(turn => turnId(turn) === bookmark.turnId);
+      return match || null;
+    }
+    return Number.isInteger(bookmark.turnIndex) && bookmark.turnIndex >= 0
+      ? turns[bookmark.turnIndex] || null : null;
+  }
+  function findTarget(bookmark, nearbyOnly = false) {
     const main = mainContent();
-    if (!main) return null;
-    const matches = [...main.querySelectorAll(BLOCKS)]
-      .map((element, index) => ({ element, index }))
-      .filter(item => normalize(item.element.textContent).includes(text));
-    if (expectedIndex >= 0) {
+    if (!main || (!bookmark.text && !bookmark.blockText)) return null;
+    const turn = findTurn(bookmark, main);
+    if (!turn && (bookmark.turnId || Number.isInteger(bookmark.turnIndex) &&
+        bookmark.turnIndex >= 0)) return null;
+    const scope = turn || main;
+    const candidates = blocks(scope);
+    const expectedIndex = turn ? bookmark.blockIndex : bookmark.index;
+    const sameText = element => {
+      if (!element) return false;
+      const content = normalize(element.textContent);
+      return Boolean(bookmark.text && content.includes(bookmark.text)) ||
+        Boolean(bookmark.blockText && content.includes(bookmark.blockText));
+    };
+    if (Number.isInteger(expectedIndex) && expectedIndex >= 0 &&
+        sameText(candidates[expectedIndex]) &&
+        (!nearbyOnly || visible(candidates[expectedIndex]))) return candidates[expectedIndex];
+    const matches = candidates.map((element, index) => ({ element, index }))
+      .filter(item => sameText(item.element));
+    if (nearbyOnly) {
+      const visibleMatches = matches.filter(item => visible(item.element));
+      if (visibleMatches.length) return visibleMatches.sort((a, b) =>
+        Math.abs(a.element.getBoundingClientRect().top - innerHeight * .4) -
+        Math.abs(b.element.getBoundingClientRect().top - innerHeight * .4))[0].element;
+      return null;
+    }
+    if (Number.isInteger(expectedIndex) && expectedIndex >= 0) {
       matches.sort((a, b) =>
         Math.abs(a.index - expectedIndex) - Math.abs(b.index - expectedIndex));
     }
     return matches[0]?.element || null;
   }
-  function visibleLabel() {
+  function visibleBlock() {
     const main = mainContent();
-    if (!main) return "当前阅读位置";
+    if (!main) return null;
     const targetY = innerHeight * .4;
-    let candidates = [...main.querySelectorAll("h1,h2,h3,h4,h5,h6")].filter(visible);
-    if (!candidates.length) candidates = [...main.querySelectorAll("p,li")].filter(visible);
+    const candidates = blocks(main).filter(visible);
     candidates.sort((a, b) =>
-      Math.abs(a.getBoundingClientRect().top - targetY) -
-      Math.abs(b.getBoundingClientRect().top - targetY));
-    return normalize(candidates[0]?.innerText).slice(0, 40) || "当前阅读位置";
+      distanceTo(a, targetY) - distanceTo(b, targetY) ||
+      a.getBoundingClientRect().height - b.getBoundingClientRect().height);
+    return candidates[0] || null;
+  }
+  function distanceTo(element, y) {
+    const rect = element.getBoundingClientRect();
+    return Math.max(rect.top - y, y - rect.bottom, 0);
   }
   function visible(element) {
     const rect = element.getBoundingClientRect();
@@ -194,12 +237,17 @@
   async function addBookmark() {
     const text = selectedText;
     selectedText = "";
-    const target = selectedElement || findText(text);
+    const target = selectedElement || visibleBlock();
     selectedElement = null;
     const top = scroller(target).scrollTop;
-    const index = target && mainContent()
-      ? [...mainContent().querySelectorAll(BLOCKS)].indexOf(target) : -1;
-    if (bookmarks.some(item => item.text === text && Math.abs(item.top - top) < 12)) {
+    const main = mainContent();
+    const turn = turnOf(target);
+    const turnIndex = turn && main ? [...main.querySelectorAll("article")].indexOf(turn) : -1;
+    const blockIndex = turn && target ? blocks(turn).indexOf(target) : -1;
+    const index = target && main ? blocks(main).indexOf(target) : -1;
+    if (bookmarks.some(item => item.turnId === turnId(turn) &&
+        item.blockIndex === blockIndex && item.text === text &&
+        Math.abs(item.top - top) < 12)) {
       say("这里已经标记过了");
       return;
     }
@@ -208,7 +256,11 @@
       top,
       text,
       index,
-      label: (text || visibleLabel()).slice(0, 40)
+      turnId: turnId(turn),
+      turnIndex,
+      blockIndex,
+      blockText: normalize(target?.textContent).slice(0, 160),
+      label: (text || normalize(target?.innerText) || "当前阅读位置").slice(0, 40)
     });
     try {
       await persist();
@@ -223,23 +275,36 @@
     catch (_) { bookmarks = previous; render(); say("删除失败，请刷新网页"); }
   }
   async function jumpTo(bookmark) {
-    let target = findText(bookmark.text, bookmark.index);
+    const hasTurn = Boolean(bookmark.turnId) ||
+      Number.isInteger(bookmark.turnIndex) && bookmark.turnIndex >= 0;
+    let target = hasTurn ? findTarget(bookmark) : null;
     if (target) { highlight(target); return; }
-    scroller(null).scrollTo({ top: bookmark.top, behavior: "smooth" });
-    if (!bookmark.text) return;
+    const main = mainContent();
+    const visibleTurn = main && [...main.querySelectorAll("article")].find(visible);
+    scroller(visibleTurn || visibleBlock()).scrollTo({ top: bookmark.top, behavior: "auto" });
+    if (!bookmark.text && !bookmark.blockText) {
+      say("已返回保存时的阅读位置");
+      return;
+    }
     for (let attempt = 0; attempt < 12; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 100));
-      target = findText(bookmark.text, bookmark.index);
+      target = findTarget(bookmark, !hasTurn);
       if (target) { highlight(target); return; }
     }
-    say("已返回附近；若内容未加载，请稍向上滚动");
+    const turn = hasTurn && mainContent() ? findTurn(bookmark, mainContent()) : null;
+    if (turn) {
+      turn.scrollIntoView({ behavior: "smooth", block: "start" });
+      say("原段落已变化，已返回这条回答的开头");
+    } else {
+      say("未找到原文，已返回保存时的附近位置");
+    }
   }
 
   function prepareSelection() {
     const selection = getSelection();
     selectedText = normalize(selection?.toString()).slice(0, 80);
     const node = selectedText && selection?.rangeCount
-      ? selection.getRangeAt(0).commonAncestorContainer : null;
+      ? selection.getRangeAt(0).startContainer : null;
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
     const block = element?.closest(BLOCKS);
     selectedElement = block && mainContent()?.contains(block) ? block : null;
