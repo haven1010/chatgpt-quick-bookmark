@@ -138,13 +138,11 @@
       scrollElement.getBoundingClientRect().top;
     return scrollElement.scrollTop + element.getBoundingClientRect().top - origin;
   }
-  function nearSavedPosition(bookmark, element) {
-    if (!Number.isFinite(bookmark.anchorY) && !Number.isFinite(bookmark.top)) return true;
+  function distanceFromSavedPosition(bookmark, element) {
+    if (!Number.isFinite(bookmark.anchorY) && !Number.isFinite(bookmark.top)) return 0;
     const expectedY = Number.isFinite(bookmark.anchorY)
       ? bookmark.anchorY : bookmark.top + innerHeight * .4;
-    const tolerance = Number.isFinite(bookmark.anchorY)
-      ? Math.max(innerHeight, 900) : innerHeight * 1.5;
-    return Math.abs(contentY(element) - expectedY) <= tolerance;
+    return Math.abs(contentY(element) - expectedY);
   }
   function turnOf(element) {
     return element?.closest("article") || element?.closest("[data-message-id]") || null;
@@ -166,40 +164,64 @@
       ? turns[bookmark.turnIndex] || null : null;
   }
   function findTarget(bookmark, nearbyOnly = false) {
-    const main = mainContent();
     if (!bookmark.text && !bookmark.blockText) return null;
-    const turn = main && findTurn(bookmark, main);
-    const sameText = element => {
-      if (!element) return false;
-      const content = normalize(element.textContent);
-      const visibleText = normalize(element.innerText);
-      return Boolean(bookmark.text &&
-        (content.includes(bookmark.text) || visibleText.includes(bookmark.text))) ||
-        Boolean(bookmark.blockText && content.includes(bookmark.blockText));
-    };
-    for (const scope of turn ? [turn, main, document] : main ? [main, document] : [document]) {
-      const candidates = blocks(scope);
-      const expectedIndex = scope === turn ? bookmark.blockIndex : bookmark.index;
-      if (Number.isInteger(expectedIndex) && expectedIndex >= 0 &&
-          sameText(candidates[expectedIndex]) &&
-          nearSavedPosition(bookmark, candidates[expectedIndex]) &&
-          (!nearbyOnly || visible(candidates[expectedIndex]))) return candidates[expectedIndex];
-      const matches = candidates.map((element, index) => ({ element, index }))
-        .filter(item => sameText(item.element) &&
-          nearSavedPosition(bookmark, item.element) &&
-          (!nearbyOnly || visible(item.element)));
-      if (matches.length) {
-        matches.sort((a, b) => {
-          if (Number.isInteger(expectedIndex) && expectedIndex >= 0) {
-            return Math.abs(a.index - expectedIndex) - Math.abs(b.index - expectedIndex);
-          }
-          return Math.abs(a.element.getBoundingClientRect().top - innerHeight * .4) -
-            Math.abs(b.element.getBoundingClientRect().top - innerHeight * .4);
+    const turns = [...document.querySelectorAll("article")];
+    const allBlocks = blocks(document);
+    const matches = (text) => allBlocks.filter(element =>
+      (!nearbyOnly || visible(element)) &&
+      (normalize(element.textContent).includes(text) ||
+        normalize(element.innerText).includes(text)));
+    let candidates = bookmark.text ? matches(bookmark.text) : [];
+    if (!candidates.length && bookmark.blockText) candidates = matches(bookmark.blockText);
+    if (!candidates.length) return null;
+
+    const sameAnswer = candidates.filter(element =>
+      bookmark.turnText && normalize(turnOf(element)?.innerText).includes(bookmark.turnText));
+    const sameTurn = bookmark.turnId && candidates.filter(element => {
+      const turn = turnOf(element);
+      const index = turns.indexOf(turn);
+      return turnId(turn) === bookmark.turnId &&
+        (!Number.isInteger(bookmark.turnIndex) || bookmark.turnIndex < 0 ||
+          index < 0 || index <= bookmark.turnIndex);
+    });
+    if (sameAnswer.length) candidates = sameAnswer;
+    else if (sameTurn?.length) candidates = sameTurn;
+    else if (bookmark.turnId || bookmark.turnText) {
+      // Older bookmarks have no answer fingerprint. Only accept a changed turn
+      // identifier if the selected text remains near its saved position.
+      const tolerance = Math.max(innerHeight, 900);
+      candidates = candidates.filter(element => {
+        const index = turns.indexOf(turnOf(element));
+        return distanceFromSavedPosition(bookmark, element) <= tolerance &&
+          (!Number.isInteger(bookmark.turnIndex) || bookmark.turnIndex < 0 ||
+            index < 0 || index <= bookmark.turnIndex);
+      });
+    } else if (Number.isInteger(bookmark.turnIndex) && bookmark.turnIndex >= 0) {
+      const sameIndex = candidates.filter(element =>
+        turns.indexOf(turnOf(element)) === bookmark.turnIndex);
+      if (sameIndex.length) candidates = sameIndex;
+      else {
+        // A follow-up adds turns after the saved one. Never use their repeated text.
+        candidates = candidates.filter(element => {
+          const index = turns.indexOf(turnOf(element));
+          return index < 0 || index < bookmark.turnIndex;
         });
-        return matches[0].element;
       }
     }
-    return null;
+    const exactBlock = element => bookmark.blockText &&
+      normalize(element.textContent).slice(0, 160) === bookmark.blockText ? 0 : 1;
+    const blockGap = element => {
+      const turn = turnOf(element);
+      return turn && Number.isInteger(bookmark.blockIndex) && bookmark.blockIndex >= 0
+        ? Math.abs(blocks(turn).indexOf(element) - bookmark.blockIndex) : 0;
+    };
+    candidates.sort((a, b) =>
+      exactBlock(a) - exactBlock(b) ||
+      blockGap(a) - blockGap(b) ||
+      distanceFromSavedPosition(bookmark, a) - distanceFromSavedPosition(bookmark, b) ||
+      Math.abs(allBlocks.indexOf(a) - bookmark.index) -
+        Math.abs(allBlocks.indexOf(b) - bookmark.index));
+    return candidates[0] || null;
   }
   function visibleBlock() {
     const main = mainContent();
@@ -279,6 +301,7 @@
       index,
       turnId: turnId(turn),
       turnIndex,
+      turnText: normalize(turn?.innerText).slice(0, 180),
       blockIndex,
       blockText: normalize(target?.textContent).slice(0, 160),
       anchorY: target ? contentY(target) : null,
@@ -307,23 +330,31 @@
       Number.isInteger(bookmark.turnIndex) && bookmark.turnIndex >= 0;
     let target = findTarget(bookmark);
     if (target) { highlight(target); return; }
-    const main = mainContent();
-    const visibleTurn = main && [...main.querySelectorAll("article")].find(visible);
-    const scrollElement = live?.scrollElement?.isConnected
-      ? live.scrollElement : scroller(visibleTurn || visibleBlock());
-    scrollElement.scrollTo({ top: bookmark.top, behavior: "auto" });
+    const turns = [...document.querySelectorAll("article")];
+    const namedTurn = findTurn(bookmark, document);
+    const savedTurn = bookmark.turnText
+      ? [namedTurn, ...turns].find(turn =>
+          turn && normalize(turn.innerText).includes(bookmark.turnText))
+      : namedTurn;
+    if (savedTurn) savedTurn.scrollIntoView({ behavior: "auto", block: "start" });
+    else {
+      const main = mainContent();
+      const visibleTurn = main && [...main.querySelectorAll("article")].find(visible);
+      const scrollElement = live?.scrollElement?.isConnected
+        ? live.scrollElement : scroller(visibleTurn || visibleBlock());
+      scrollElement.scrollTo({ top: bookmark.top, behavior: "auto" });
+    }
     if (!bookmark.text && !bookmark.blockText) {
       say("已返回保存时的阅读位置");
       return;
     }
-    for (let attempt = 0; attempt < 12; attempt++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 100));
       target = findTarget(bookmark, !hasTurn);
       if (target) { highlight(target); return; }
     }
-    const turn = hasTurn && mainContent() ? findTurn(bookmark, mainContent()) : null;
-    if (turn) {
-      turn.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (savedTurn?.isConnected) {
+      savedTurn.scrollIntoView({ behavior: "smooth", block: "start" });
       say("原段落已变化，已返回这条回答的开头");
     } else {
       say("未找到原文，已返回保存时的附近位置");
