@@ -3,12 +3,24 @@
   "name": "ChatGPT 随手书签",
   "version": "1.2.0",
   "description": "在 ChatGPT 对话中保存多个阅读位置，随时跳回。",
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["bookmarks.js"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "bookmarks.js"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "chatgpt-quick-bookmark-icons/chatgpt-quick-bookmark-icon-16.png",
+    "48": "chatgpt-quick-bookmark-icons/chatgpt-quick-bookmark-icon-48.png",
+    "128": "chatgpt-quick-bookmark-icons/chatgpt-quick-bookmark-icon-128.png"
+  }
 }
