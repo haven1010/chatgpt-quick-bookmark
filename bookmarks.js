@@ -7,6 +7,7 @@
   let route = location.pathname;
   let bookmarks = [];
   const liveTargets = new Map();
+  let cachedPane = null;
   let selectedText = "";
   let selectedElement = null;
   let noticeTimer;
@@ -78,7 +79,8 @@
     clearTimeout(noticeTimer);
     noticeTimer = setTimeout(() => { notice.style.display = "none"; }, 2200);
   }
-  function key() { return PREFIX + location.pathname; }
+  function key(path = location.pathname) { return PREFIX + location.host + path; }
+  function oldKey(path) { return PREFIX + path; }
   function normalize(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
   function setExpanded(value) {
     compact.hidden = value;
@@ -117,20 +119,41 @@
       /(auto|scroll)/.test(getComputedStyle(element).overflowY) &&
       element.scrollHeight > element.clientHeight + 30);
   }
+  function readingPane() {
+    if (cachedPane?.isConnected && isScrollable(cachedPane)) return cachedPane;
+    const options = [...document.querySelectorAll("*")].filter(isScrollable)
+      .filter(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > innerWidth * .3 && rect.height > innerHeight * .3 &&
+          rect.left < innerWidth * .7 && rect.right > innerWidth * .3;
+      });
+    cachedPane = options.sort((a, b) => {
+      const area = element => element.clientWidth * element.clientHeight;
+      return area(b) - area(a);
+    })[0] || null;
+    return cachedPane;
+  }
   function scroller(near) {
     for (let element = near; element; element = element.parentElement) {
       if (isScrollable(element)) return element;
     }
-    const main = document.querySelector("main") || document.querySelector('[role="main"]');
-    const options = main ? [main, ...main.querySelectorAll("*")] : [];
-    return options.filter(isScrollable).sort((a, b) =>
-      (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] ||
-      document.scrollingElement || document.documentElement;
+    return readingPane() || document.scrollingElement || document.documentElement;
   }
   function mainContent() {
-    return document.querySelector("main") || document.querySelector('[role="main"]');
+    if (location.hostname === "chat.deepseek.com") {
+      const pane = readingPane();
+      if (pane) return pane;
+    }
+    const main = document.querySelector("main") || document.querySelector('[role="main"]');
+    return main && blocks(main).length ? main : readingPane() || document.body;
   }
   function blocks(scope) { return [...scope.querySelectorAll(BLOCKS)]; }
+  function fallbackBlocks(scope) {
+    return [...scope.querySelectorAll("div,span")].filter(element => {
+      const text = normalize(element.innerText);
+      return text.length >= 4 && text.length <= 500 && !element.isContentEditable;
+    });
+  }
   function contentY(element) {
     const scrollElement = scroller(element);
     const origin = scrollElement === document.scrollingElement ||
@@ -166,6 +189,7 @@
   function findTarget(bookmark, nearbyOnly = false) {
     if (!bookmark.text && !bookmark.blockText) return null;
     const turns = [...document.querySelectorAll("article")];
+    const main = mainContent();
     const allBlocks = blocks(document);
     const matches = (text) => allBlocks.filter(element =>
       (!nearbyOnly || visible(element)) &&
@@ -173,6 +197,13 @@
         normalize(element.innerText).includes(text)));
     let candidates = bookmark.text ? matches(bookmark.text) : [];
     if (!candidates.length && bookmark.blockText) candidates = matches(bookmark.blockText);
+    if (!candidates.length) {
+      const text = bookmark.text || bookmark.blockText;
+      candidates = fallbackBlocks(document).filter(element =>
+        (!nearbyOnly || visible(element)) &&
+        (normalize(element.textContent).includes(text) ||
+          normalize(element.innerText).includes(text)));
+    }
     if (!candidates.length) return null;
 
     const sameAnswer = candidates.filter(element =>
@@ -215,19 +246,31 @@
       return turn && Number.isInteger(bookmark.blockIndex) && bookmark.blockIndex >= 0
         ? Math.abs(blocks(turn).indexOf(element) - bookmark.blockIndex) : 0;
     };
+    const scopedBlocks = bookmark.fallbackBlock ? fallbackBlocks(main) : blocks(main);
+    const indexGap = element => Number.isInteger(bookmark.index) && bookmark.index >= 0
+      ? Math.abs(scopedBlocks.indexOf(element) - bookmark.index) : 0;
     candidates.sort((a, b) =>
       exactBlock(a) - exactBlock(b) ||
       blockGap(a) - blockGap(b) ||
+      (!bookmark.turnId && !bookmark.turnText ? indexGap(a) - indexGap(b) : 0) ||
       distanceFromSavedPosition(bookmark, a) - distanceFromSavedPosition(bookmark, b) ||
-      Math.abs(allBlocks.indexOf(a) - bookmark.index) -
-        Math.abs(allBlocks.indexOf(b) - bookmark.index));
+      indexGap(a) - indexGap(b));
     return candidates[0] || null;
   }
   function visibleBlock() {
     const main = mainContent();
     if (!main) return null;
     const targetY = innerHeight * .4;
-    const candidates = blocks(main).filter(visible);
+    const centered = elements => elements.filter(element => {
+      const rect = element.getBoundingClientRect();
+      return rect.left < innerWidth * .7 && rect.right > innerWidth * .3;
+    });
+    const semantic = blocks(main).filter(visible);
+    const centerSemantic = centered(semantic);
+    const centerFallback = centerSemantic.length ? [] :
+      centered(fallbackBlocks(main).filter(visible));
+    const candidates = centerSemantic.length ? centerSemantic :
+      centerFallback.length ? centerFallback : semantic;
     candidates.sort((a, b) =>
       distanceTo(a, targetY) - distanceTo(b, targetY) ||
       a.getBoundingClientRect().height - b.getBoundingClientRect().height);
@@ -261,12 +304,16 @@
     route = path;
     bookmarks = [];
     liveTargets.clear();
+    cachedPane = null;
     setExpanded(false);
     render();
     try {
-      const result = await chrome.storage.local.get(PREFIX + path);
+      const storageKey = key(path);
+      const result = await chrome.storage.local.get([storageKey, oldKey(path)]);
       if (location.pathname !== path) return;
-      const saved = result[PREFIX + path];
+      const saved = result[storageKey] ??
+        (location.hostname === "chatgpt.com" || location.hostname === "chat.openai.com"
+          ? result[oldKey(path)] : null);
       bookmarks = Array.isArray(saved) ? saved : saved ? [{
         id: `old-${Date.now()}`,
         top: saved.top,
@@ -286,7 +333,10 @@
     const turn = turnOf(target);
     const turnIndex = turn && main ? [...main.querySelectorAll("article")].indexOf(turn) : -1;
     const blockIndex = turn && target ? blocks(turn).indexOf(target) : -1;
-    const index = target && main ? blocks(main).indexOf(target) : -1;
+    const semanticIndex = target && main ? blocks(main).indexOf(target) : -1;
+    const fallbackBlock = semanticIndex < 0;
+    const index = semanticIndex >= 0 ? semanticIndex :
+      target && main ? fallbackBlocks(main).indexOf(target) : -1;
     if (bookmarks.some(item => item.turnId === turnId(turn) &&
         item.blockIndex === blockIndex && item.text === text &&
         Math.abs(item.top - top) < 12)) {
@@ -299,6 +349,7 @@
       top,
       text,
       index,
+      fallbackBlock,
       turnId: turnId(turn),
       turnIndex,
       turnText: normalize(turn?.innerText).slice(0, 180),
@@ -367,7 +418,15 @@
     const node = selectedText && selection?.rangeCount
       ? selection.getRangeAt(0).startContainer : null;
     const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-    const block = element?.closest(BLOCKS);
+    let block = element?.closest(BLOCKS);
+    if (!block) {
+      for (let parent = element; parent && parent !== document.body;
+          parent = parent.parentElement) {
+        const content = normalize(parent.innerText);
+        if (parent.matches?.("div,span") && content.includes(selectedText) &&
+            content.length <= 500) { block = parent; break; }
+      }
+    }
     selectedElement = block?.getRootNode() === document ? block : null;
   }
   ui.getElementById("quick-save").addEventListener("pointerdown", prepareSelection);
