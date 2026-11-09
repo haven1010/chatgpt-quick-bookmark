@@ -1,0 +1,29 @@
+[data-qb-fold="question"] {
+  cursor: pointer !important;
+  display: block !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow: visible !important;
+  font-size: 0 !important;
+  line-height: 0 !important;
+}
+
+[data-qb-fold="question"] > * { display: none !important; }
+
+[data-qb-fold="question"]::before {
+  content: "▶ " attr(data-qb-summary);
+  display: block;
+  box-sizing: border-box;
+  padding: 10px 14px;
+  border: 1px solid #9996;
+  border-radius: 9px;
+  font: 14px/1.4 system-ui, sans-serif;
+  color: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-qb-fold="answer"] { display: none !important; }
